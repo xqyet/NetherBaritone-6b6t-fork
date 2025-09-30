@@ -60,6 +60,15 @@ public class PathingControlManager implements IPathingControlManager {
         processes.add(process);
     }
 
+    @Override
+    public void requestControl(IBaritoneProcess process) {
+        if (!processes.contains(process)) {
+            throw new IllegalArgumentException("Process not registered: " + process.displayName());
+        }
+        inControlThisTick = process;
+    }
+
+
     public void cancelEverything() { // called by PathingBehavior on TickEvent Type OUT
         inControlLastTick = null;
         inControlThisTick = null;

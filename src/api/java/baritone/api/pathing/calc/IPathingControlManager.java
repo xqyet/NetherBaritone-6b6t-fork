@@ -44,4 +44,6 @@ public interface IPathingControlManager {
      * @return The most recent pathing command executed
      */
     Optional<PathingCommand> mostRecentCommand();
+
+    void requestControl(IBaritoneProcess process);
 }

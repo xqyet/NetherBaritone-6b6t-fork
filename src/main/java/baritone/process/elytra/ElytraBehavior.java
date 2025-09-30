@@ -488,6 +488,20 @@ public final class ElytraBehavior implements Helper {
         this.context.destroy();
     }
 
+    // ElytraBehavior.java
+    public Optional<Vec3> currentGuidancePoint() {
+        // Prefer the point the solver just used this tick
+        if (this.pendingSolution != null && this.pendingSolution.goingTo != null) {
+            return Optional.of(this.pendingSolution.goingTo);
+        }
+        final NetherPath p = this.pathManager.getPath();
+        if (p == null || p.isEmpty()) return Optional.empty();
+        final int near = Math.max(0, Math.min(this.pathManager.getNear(), p.size() - 1));
+        // Look ahead a bit based on speed (2–8 steps)
+        final int lookahead = Math.min(near + 6, p.size() - 1);
+        return Optional.of(p.getVec(lookahead));
+    }
+
     public void repackChunks() {
         ChunkSource chunkProvider = ctx.world().getChunkSource();
 
