@@ -96,6 +96,15 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private long lastVerticalInputTime = 0;
     private double altI = 0;                // integral term
     private int vertCooldownTicks = 0;      // hysteresis to avoid key spam
+    private enum VertMode { UP, DOWN, COAST }
+    private VertMode vertMode = VertMode.COAST;
+    private int vertModeTicks = 0;
+    private double altErrFilt = 0.0;
+
+    // anti-stuck helpers
+    private int stuckTicks = 0;
+    private int unstickTicks = 0;
+    private boolean strafeRight = true;
 
     // Tunables (start with these; adjust to taste)
     private static final double ALT_DEADBAND = 0.9;   // blocks
@@ -105,8 +114,27 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final double CMD_UP  =  0.55;      // command threshold for SPACE
     private static final double CMD_DOWN= -0.55;      // command threshold for SHIFT
     private static final int    PULSE_TICKS = 3;      // how long to hold SPACE/SHIFT per correction
+    private static final int REFRACTORY_TICKS = 12; // wait this many ticks before another vertical assist
 
+    private static final double URGENT_MULT = 1.8;       // urgent if |err| > ALT_HI * URGENT_MULT
+    private static final double STALL_VY = 0.03;         // consider "stalled" if |vy| < 0.03
+    private static final int REFRACTORY_TICKS_SHORT = 6; // shorter cooldown for back-to-back small corrections
+
+    private static final int    GROUND_PROBE_BLOCKS = 4;   // how far down we scan below feet
+    private static final double GROUND_MIN_CLEAR    = 1.6; // minimum air under feet to avoid landing
+    private static final double GROUND_FLARE_EXTRA  = 0.4; // extra margin if descending (vy < 0)
     private static final long W_DELAY_MS = 250; // 0.25 sec delay before re-pressing W
+
+
+    // How many full-air blocks are directly under our feet (up to maxBlocks)
+    private int airBelowFeet(BetterBlockPos feet, int maxBlocks) {
+        for (int i = 1; i <= maxBlocks; i++) {
+            if (!isAir(feet.below(i))) {
+                return i - 1;
+            }
+        }
+        return maxBlocks;
+    }
 
     @Override
     public boolean isActive() {
@@ -229,41 +257,158 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 baritone.getInputOverrideHandler().clearAllKeys(); // start clean
 
 // 1) Get a guidance point from the behavior
+                baritone.getInputOverrideHandler().clearAllKeys(); // start clean
+
+// --- Smooth vertical controller (bias forward, fewer vertical corrections) ---
                 Optional<Vec3> guideOpt = behavior.currentGuidancePoint();
                 if (guideOpt.isPresent()) {
                     Vec3 guide = guideOpt.get();
-                    double playerY = ctx.player().position().y;
-                    double error = (guide.y + 0.5) - playerY; // center the node
 
-                    // 2) PI control on altitude
-                    double e = Math.abs(error) < ALT_DEADBAND ? 0.0 : error;
-                    altI = Math.max(-ALT_I_CLAMP, Math.min(ALT_I_CLAMP, altI + e));
-                    double u = KP * e + KI * altI;
+                    // Always drive forward for speed; vertical nudges overlay on top
+                    baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
 
-                    // 3) Hysteresis to avoid flapping every tick
-                    if (vertCooldownTicks > 0) vertCooldownTicks--;
+                    // error & filter
+                    double rawErr = (guide.y + 0.5) - ctx.player().position().y;
+                    final double ALPHA = 0.25;
+                    altErrFilt = (1.0 - ALPHA) * altErrFilt + ALPHA * rawErr;
 
-                    boolean pressingUp = false, pressingDown = false;
-                    if (vertCooldownTicks == 0) {
-                        if (u > CMD_UP) {
-                            baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);   // SPACE
-                            pressingUp = true;
-                            vertCooldownTicks = PULSE_TICKS;
-                        } else if (u < CMD_DOWN) {
-                            baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);  // SHIFT
-                            pressingDown = true;
-                            vertCooldownTicks = PULSE_TICKS;
+                    // velocity
+                    Vec3 vel = ctx.player().getDeltaMovement();
+                    double vy = vel.y;
+                    double vh = Math.hypot(vel.x, vel.z);
+
+                    // engage/release thresholds (your values)
+                    final double ALT_HI = 2.5;
+                    final double ALT_LO = 1.2;
+                    final double VY_OK_UP   =  0.16;
+                    final double VY_OK_DOWN = -0.16;
+                    final int MODE_MIN_TICKS = 3;
+                    int dynMax = Math.min(10, Math.max(4, 2 + (int)(Math.abs(altErrFilt) * 1.5)));
+
+                    // urgent/stall (your values)
+                    boolean urgent  = Math.abs(rawErr) > ALT_HI * URGENT_MULT || Math.abs(altErrFilt) > ALT_HI * URGENT_MULT;
+                    boolean stalled = Math.abs(vy) < STALL_VY && Math.abs(altErrFilt) > ALT_HI;
+
+                    // NEW: environment checks
+                    BetterBlockPos feet = ctx.playerFeet();
+                    boolean ceilingBlocked = !hasClearanceAbove(feet, 2);   // no headroom to climb
+                    boolean aheadBlocked   = obstacleAhead(feet);           // wall right in front
+
+                    // --- Ground proximity guard ---
+                    int airBelow = airBelowFeet(feet, GROUND_PROBE_BLOCKS);
+                    boolean nearGround = airBelow < (int)Math.ceil(GROUND_MIN_CLEAR + (vy < 0 ? GROUND_FLARE_EXTRA : 0.0));
+
+
+                    // NEW: stuck detector -> if almost no movement or a wall right ahead for ~8 ticks, run an unstick strafe
+                    if (aheadBlocked || (vh < 0.04 && Math.abs(vy) < 0.02)) {
+                        stuckTicks++;
+                    } else {
+                        stuckTicks = 0;
+                    }
+                    if (stuckTicks > 8) {
+                        unstickTicks = 10;                // brief lateral slip
+                        strafeRight = !strafeRight;       // alternate sides to avoid sawtooth
+                        stuckTicks = 0;
+                    }
+
+                    // handle refractory
+                    if (vertCooldownTicks > 0) {
+                        vertCooldownTicks--;
+                        if (urgent || stalled) {
+                            // allow immediate follow-up if we badly need it
+                            vertCooldownTicks = 0;
                         }
                     }
 
-                    // 4) Forward is optional — only when vertically aligned
-                    if (!pressingUp && !pressingDown && e == 0.0) {
+                    // NEW: if unstick sequence is active, do it and skip the normal UP/DOWN state machine this tick
+                    if (unstickTicks > 0) {
+                        baritone.getInputOverrideHandler().setInputForceState(strafeRight ? Input.MOVE_RIGHT : Input.MOVE_LEFT, true);
                         baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
+                        if (ceilingBlocked) {
+                            // drop a touch if we are pinned by ceiling
+                            baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                        }
+                        unstickTicks--;
+                    } else {
+                        // Normal vertical state machine
+                        switch (vertMode) {
+                            case COAST: {
+                                if (vertCooldownTicks == 0) {
+                                    // Only engage UP if we have headroom, DOWN only if NOT near ground
+                                    if (!ceilingBlocked && altErrFilt > ALT_HI && vy < VY_OK_UP) {
+                                        baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+                                        vertMode = VertMode.UP;
+                                        vertModeTicks = 1;
+                                    } else if (!nearGround && altErrFilt < -ALT_HI && vy > VY_OK_DOWN) {
+                                        baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                                        vertMode = VertMode.DOWN;
+                                        vertModeTicks = 1;
+                                    }
+                                }
+
+                                // If we’re too close to the floor and descending, flare to avoid a touch-down
+                                if (nearGround && vy <= 0.0) {
+                                    baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+                                }
+                                break;
+                            }
+
+
+                            case UP: {
+                                // If we suddenly see ceiling or a wall ahead, bail from UP immediately and try to slip under
+                                if (ceilingBlocked || aheadBlocked) {
+                                    vertMode = VertMode.COAST;
+                                    vertModeTicks = 0;
+                                    vertCooldownTicks = REFRACTORY_TICKS_SHORT;
+                                    // bias down for 1 tick to get unstuck
+                                    baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                                    break;
+                                }
+
+                                baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+                                baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
+                                vertModeTicks++;
+
+                                boolean crossed   = rawErr < 0;                            // overshot
+                                boolean recovered = Math.abs(altErrFilt) < ALT_LO && vy >= 0.0;
+                                boolean timeout   = vertModeTicks >= dynMax;
+
+                                if ((recovered && vertModeTicks >= MODE_MIN_TICKS) || crossed || timeout) {
+                                    vertMode = VertMode.COAST;
+                                    vertModeTicks = 0;
+                                    vertCooldownTicks = (urgent || stalled) ? REFRACTORY_TICKS_SHORT : REFRACTORY_TICKS;
+                                }
+                                break;
+                            }
+
+                            case DOWN: {
+                                vertMode = VertMode.COAST;
+                                vertModeTicks = 0;
+                                vertCooldownTicks = REFRACTORY_TICKS_SHORT;
+                                baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                                baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
+                                vertModeTicks++;
+
+                                boolean crossed   = rawErr > 0;                            // overshot
+                                boolean recovered = Math.abs(altErrFilt) < ALT_LO && vy <= 0.0;
+                                boolean timeout   = vertModeTicks >= dynMax;
+
+                                if ((recovered && vertModeTicks >= MODE_MIN_TICKS) || crossed || timeout) {
+                                    vertMode = VertMode.COAST;
+                                    vertModeTicks = 0;
+                                    vertCooldownTicks = (urgent || stalled) ? REFRACTORY_TICKS_SHORT : REFRACTORY_TICKS;
+                                }
+                                break;
+                            }
+                        }
                     }
                 } else {
-                    // No guidance point available; safe default
+                    // No guidance point available -> just go forward
                     baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
                 }
+
+
+
 
             }
 
@@ -564,6 +709,24 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
     private boolean isSafeBlock(Block block) {
         return block == Blocks.NETHERRACK || block == Blocks.GRAVEL || (block == Blocks.NETHER_BRICKS && Baritone.settings().elytraAllowLandOnNetherFortress.value);
+    }
+
+    private boolean isAir(BlockPos pos) {
+        return ctx.world().getBlockState(pos).getBlock() == Blocks.AIR;
+    }
+
+    private boolean hasClearanceAbove(BlockPos base, int blocks) {
+        for (int i = 1; i <= blocks; i++) {
+            if (!isAir(base.above(i))) return false;
+        }
+        return true;
+    }
+
+    private boolean obstacleAhead(BlockPos base) {
+        net.minecraft.core.Direction dir = ctx.player().getDirection();
+        BlockPos front = base.relative(dir);
+        // check one block ahead and the block above it (simple, cheap)
+        return !isAir(front) || !isAir(front.above());
     }
 
     private boolean isSafeBlock(BlockPos pos) {
