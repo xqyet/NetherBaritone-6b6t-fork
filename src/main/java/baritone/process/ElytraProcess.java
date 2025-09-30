@@ -101,7 +101,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int vertModeTicks = 0;
     private double altErrFilt = 0.0;
 
-    // anti-stuck helpers
+    // helpers
     private int stuckTicks = 0;
     private int unstickTicks = 0;
     private boolean strafeRight = true;
@@ -114,7 +114,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final double CMD_UP  =  0.55;      // command threshold for SPACE
     private static final double CMD_DOWN= -0.55;      // command threshold for SHIFT
     private static final int    PULSE_TICKS = 3;      // how long to hold SPACE/SHIFT per correction
-    private static final int REFRACTORY_TICKS = 12; // wait this many ticks before another vertical assist
+    private static final int REFRACTORY_TICKS = 12;   // wait this many ticks before another vertical assist
 
     private static final double URGENT_MULT = 1.8;       // urgent if |err| > ALT_HI * URGENT_MULT
     private static final double STALL_VY = 0.03;         // consider "stalled" if |vy| < 0.03
@@ -126,7 +126,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final long W_DELAY_MS = 250; // 0.25 sec delay before re-pressing W
 
 
-    // How many full-air blocks are directly under our feet (up to maxBlocks)
+    // How many full-air blocks are directly under player (up to maxBlocks)
     private int airBelowFeet(BetterBlockPos feet, int maxBlocks) {
         for (int i = 1; i <= maxBlocks; i++) {
             if (!isAir(feet.below(i))) {
@@ -196,14 +196,13 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     logNotification("Pathing complete", false);
                 }
                 if (Baritone.settings().disconnectOnArrival.value && !reachedGoal) {
-                    // don't be active when the user logs back in
+                    // don't be active when user logs back in
                     this.onLostControl();
                     ctx.world().disconnect();
                     return new PathingCommand(null, PathingCommandType.CANCEL_AND_SET_GOAL);
                 }
                 reachedGoal = true;
 
-                // we are goingToLandingSpot and we are in the last node of the path
                 if (this.goingToLandingSpot) {
                     this.state = State.LANDING;
                     logDirect("Above the landing spot, landing...");
@@ -218,7 +217,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 Vec3 to = new Vec3(((double) endPos.x) + 0.5, from.y, ((double) endPos.z) + 0.5);
                 Rotation rotation = RotationUtils.calcRotationFromVec3d(from, to, ctx.playerRotations());
                 baritone.getLookBehavior().updateTarget(new Rotation(rotation.getYaw(), 0), false); // this will be overwritten, probably, by behavior tick
-// 🔽 Add this check right here:
+                // check
                 if (baritone.getPathingControlManager().mostRecentInControl().orElse(null) != this) {
                     System.out.println("ElytraProcess doesn't have control!");
                 }
@@ -256,15 +255,12 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             if (baritone.getPathingControlManager().mostRecentInControl().orElse(null) == this) {
                 baritone.getInputOverrideHandler().clearAllKeys(); // start clean
 
-// 1) Get a guidance point from the behavior
                 baritone.getInputOverrideHandler().clearAllKeys(); // start clean
 
-// --- Smooth vertical controller (bias forward, fewer vertical corrections) ---
                 Optional<Vec3> guideOpt = behavior.currentGuidancePoint();
                 if (guideOpt.isPresent()) {
                     Vec3 guide = guideOpt.get();
 
-                    // Always drive forward for speed; vertical nudges overlay on top
                     baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
 
                     // error & filter
@@ -277,7 +273,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     double vy = vel.y;
                     double vh = Math.hypot(vel.x, vel.z);
 
-                    // engage/release thresholds (your values)
+                    // engage/release threshold (using new constants)
                     final double ALT_HI = 2.5;
                     final double ALT_LO = 1.2;
                     final double VY_OK_UP   =  0.16;
@@ -285,11 +281,11 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     final int MODE_MIN_TICKS = 3;
                     int dynMax = Math.min(10, Math.max(4, 2 + (int)(Math.abs(altErrFilt) * 1.5)));
 
-                    // urgent/stall (your values)
+                    // urgent/stall (same thing, new constants)
                     boolean urgent  = Math.abs(rawErr) > ALT_HI * URGENT_MULT || Math.abs(altErrFilt) > ALT_HI * URGENT_MULT;
                     boolean stalled = Math.abs(vy) < STALL_VY && Math.abs(altErrFilt) > ALT_HI;
 
-                    // NEW: environment checks
+                    // environment checks
                     BetterBlockPos feet = ctx.playerFeet();
                     boolean ceilingBlocked = !hasClearanceAbove(feet, 2);   // no headroom to climb
                     boolean aheadBlocked   = obstacleAhead(feet);           // wall right in front
@@ -298,8 +294,6 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     int airBelow = airBelowFeet(feet, GROUND_PROBE_BLOCKS);
                     boolean nearGround = airBelow < (int)Math.ceil(GROUND_MIN_CLEAR + (vy < 0 ? GROUND_FLARE_EXTRA : 0.0));
 
-
-                    // NEW: stuck detector -> if almost no movement or a wall right ahead for ~8 ticks, run an unstick strafe
                     if (aheadBlocked || (vh < 0.04 && Math.abs(vy) < 0.02)) {
                         stuckTicks++;
                     } else {
@@ -407,13 +401,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                     baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
                 }
 
-
-
-
             }
-
-
-
 
             float pitch = 0;
             if (behavior != null && behavior.pathManager != null && behavior.pathManager.path != null) {
