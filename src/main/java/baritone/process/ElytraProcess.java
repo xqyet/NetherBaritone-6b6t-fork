@@ -106,6 +106,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private int unstickTicks = 0;
     private boolean strafeRight = true;
 
+    private double prevAltErr = 0.0;
+    private int pwmTick = 0;
+
     // Tunables (start with these; adjust to taste)
     private static final double ALT_DEADBAND = 0.9;   // blocks
     private static final double ALT_I_CLAMP = 10;     // integral clamp
@@ -124,6 +127,18 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
     private static final double GROUND_MIN_CLEAR    = 1.6; // minimum air under feet to avoid landing
     private static final double GROUND_FLARE_EXTRA  = 0.4; // extra margin if descending (vy < 0)
     private static final long W_DELAY_MS = 250; // 0.25 sec delay before re-pressing W
+
+
+
+    private static final int PWM_PERIOD = 12;      // ticks per PWM cycle
+    private static final double DUTY_KP = 0.085;   // duty proportional to |alt error|
+    private static final double DUTY_KD = 0.45;    // subtract when vertical velocity already helping
+    private static final double DUTY_MIN = 0.10;   // never fully off while in UP/DOWN
+    private static final double DUTY_MAX = 0.85;   // avoid full press (reduces jerk)
+
+    // small helper
+    private static double clamp(double v, double lo, double hi) { return Math.max(lo, Math.min(hi, v)); }
+
 
 
     // How many full-air blocks are directly under player (up to maxBlocks)
@@ -232,7 +247,6 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
             baritone.getPathingControlManager().requestControl(this);
             behavior.landingMode = this.state == State.LANDING;
             this.goal = null;
-            baritone.getInputOverrideHandler().clearAllKeys();
             behavior.tick();
 
             IPathExecutor executor = baritone.getPathingBehavior().getCurrent();
@@ -250,13 +264,9 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                 }
             }
 
-            baritone.getInputOverrideHandler().clearAllKeys(); // always start clean
 
             if (baritone.getPathingControlManager().mostRecentInControl().orElse(null) == this) {
-                baritone.getInputOverrideHandler().clearAllKeys(); // start clean
-
-                baritone.getInputOverrideHandler().clearAllKeys(); // start clean
-
+                baritone.getInputOverrideHandler().clearAllKeys();
                 Optional<Vec3> guideOpt = behavior.currentGuidancePoint();
                 if (guideOpt.isPresent()) {
                     Vec3 guide = guideOpt.get();
@@ -265,7 +275,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
                     // error & filter
                     double rawErr = (guide.y + 0.5) - ctx.player().position().y;
-                    final double ALPHA = 0.25;
+                    final double ALPHA = 0.18;
                     altErrFilt = (1.0 - ALPHA) * altErrFilt + ALPHA * rawErr;
 
                     // velocity
@@ -349,21 +359,35 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
 
 
                             case UP: {
-                                // If we suddenly see ceiling or a wall ahead, bail from UP immediately and try to slip under
+                                // bail if ceiling/wall shows up
                                 if (ceilingBlocked || aheadBlocked) {
                                     vertMode = VertMode.COAST;
                                     vertModeTicks = 0;
                                     vertCooldownTicks = REFRACTORY_TICKS_SHORT;
-                                    // bias down for 1 tick to get unstuck
-                                    baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                                    baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true); // slip under ceiling
                                     break;
                                 }
 
-                                baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+                                // Duty cycle based on error, damped by current upward velocity
+                                double err = Math.max(0.0, altErrFilt);         // only care about "need to go up"
+                                double vyHelp = Math.max(0.0, vy);              // already going up?
+                                double duty = DUTY_KP * err - DUTY_KD * vyHelp; // basic PD-ish duty
+                                duty = clamp(duty, DUTY_MIN, DUTY_MAX);
+
+                                // PWM pulse for this tick
+                                int onTicks = (int)Math.round(duty * PWM_PERIOD);
+                                boolean pulse = (pwmTick % PWM_PERIOD) < onTicks;
+
+                                if (pulse) {
+                                    baritone.getInputOverrideHandler().setInputForceState(Input.JUMP, true);
+                                }
                                 baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
+
+                                pwmTick++;
                                 vertModeTicks++;
 
-                                boolean crossed   = rawErr < 0;                            // overshot
+                                // exit rules (same idea as before)
+                                boolean crossed   = rawErr < 0;                              // overshot
                                 boolean recovered = Math.abs(altErrFilt) < ALT_LO && vy >= 0.0;
                                 boolean timeout   = vertModeTicks >= dynMax;
 
@@ -375,15 +399,27 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                                 break;
                             }
 
+
                             case DOWN: {
-                                vertMode = VertMode.COAST;
-                                vertModeTicks = 0;
-                                vertCooldownTicks = REFRACTORY_TICKS_SHORT;
-                                baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                                // avoid pushing down if we're too close to ground (keep your nearGround guard outside)
+                                // Duty cycle based on downward error, damped by existing downward speed
+                                double err = Math.max(0.0, -altErrFilt);        // only care about "need to go down"
+                                double vyHelp = Math.max(0.0, -vy);             // already going down?
+                                double duty = DUTY_KP * err - DUTY_KD * vyHelp; // basic PD-ish duty
+                                duty = clamp(duty, DUTY_MIN, DUTY_MAX);
+
+                                int onTicks = (int)Math.round(duty * PWM_PERIOD);
+                                boolean pulse = (pwmTick % PWM_PERIOD) < onTicks;
+
+                                if (pulse) {
+                                    baritone.getInputOverrideHandler().setInputForceState(Input.SNEAK, true);
+                                }
                                 baritone.getInputOverrideHandler().setInputForceState(Input.MOVE_FORWARD, true);
+
+                                pwmTick++;
                                 vertModeTicks++;
 
-                                boolean crossed   = rawErr > 0;                            // overshot
+                                boolean crossed   = rawErr > 0;                              // overshot
                                 boolean recovered = Math.abs(altErrFilt) < ALT_LO && vy <= 0.0;
                                 boolean timeout   = vertModeTicks >= dynMax;
 
@@ -394,6 +430,7 @@ public class ElytraProcess extends BaritoneProcessHelper implements IBaritonePro
                                 }
                                 break;
                             }
+
                         }
                     }
                 } else {
